@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Jun 16 10:41:41 2025
+Created on Thu Jun 26 09:15:25 2025
 
 @author: rportatil115
 """
@@ -16,46 +16,48 @@ from sklearn.metrics import mean_squared_error
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 import warnings
 import os
 import joblib
-from prophet import Prophet # Importar Prophet
+from prophet import Prophet
+import datetime
 
+# Suprimir advertencias (útil para Streamlit, pero usar con precaución en desarrollo)
 warnings.filterwarnings('ignore')
 
 # --- Constantes de Configuración ---
 DEFAULT_TICKER = "AAPL"
-DEFAULT_START_DATE = "2010-01-01"
-DEFAULT_END_DATE = "2025-06-13"
 DEFAULT_PREDICT_DAYS = 30
 DEFAULT_BIAS = 0.0
 DEFAULT_NOISE_FACTOR = 0.01
 DEFAULT_RNN_LOOK_BACK = 60
 
-# Aumentar la capacidad y las épocas para los modelos de Deep Learning
-TRANSFORMER_D_MODEL =  32 # Antes 64
-TRANSFORMER_NHEAD = 4    # Antes 4
-TRANSFORMER_NUM_LAYERS = 2 # Antes 2
+TRANSFORMER_D_MODEL = 32
+TRANSFORMER_NHEAD = 4
+TRANSFORMER_NUM_LAYERS = 2
 RNN_HIDDEN_SIZE = 100
 RNN_NUM_LAYERS = 1
-RNN_EPOCHS = 150 # Aumentado de 150 a 250
+RNN_EPOCHS = 150
 RNN_LEARNING_RATE = 0.001
-ARIMA_ORDER = (5, 1, 0)
+BATCH_SIZE = 64
+ARIMA_ORDER = (5, 1, 0) # Orden (p, d, q) para ARIMA
 
-# Parámetros específicos para Prophet
 PROPHET_SEASONALITY_MODE = 'multiplicative'
-PROPHET_CHANGELPOINT_PRIOR_SCALE = 0.05 # Para hacer la tendencia más flexible
+PROPHET_CHANGELPOINT_PRIOR_SCALE = 0.05
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# --- Modelos ---
+# --- Modelos PyTorch ---
 class RNNModel(nn.Module):
+    """
+    Modelo de Red Neuronal Recurrente (RNN o LSTM).
+    """
     def __init__(self, input_size=1, hidden_size=RNN_HIDDEN_SIZE, num_layers=RNN_NUM_LAYERS, rnn_type='lstm'):
         super(RNNModel, self).__init__()
         self.rnn_type = rnn_type
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-
         if rnn_type == 'lstm':
             self.rnn = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True).to(DEVICE)
         elif rnn_type == 'rnn':
@@ -71,12 +73,14 @@ class RNNModel(nn.Module):
             out, _ = self.rnn(x, (h0, c0))
         else:
             out, _ = self.rnn(x, h0)
-        out = out[:, -1, :]
+        out = out[:, -1, :] # Tomar la salida del último paso de la secuencia
         out = self.fc(out)
         return out
 
-# --- TRANSFORMER ---
 class TransformerModel(nn.Module):
+    """
+    Modelo Transformer para predicción de series temporales.
+    """
     def __init__(self, input_size=1, d_model=TRANSFORMER_D_MODEL, nhead=TRANSFORMER_NHEAD, num_layers=TRANSFORMER_NUM_LAYERS):
         super(TransformerModel, self).__init__()
         self.input_linear = nn.Linear(input_size, d_model)
@@ -87,53 +91,49 @@ class TransformerModel(nn.Module):
     def forward(self, src):
         src = self.input_linear(src)
         out = self.transformer_encoder(src)
-        out = out[:, -1, :]
+        out = out[:, -1, :] # Tomar la salida del último token de la secuencia
         out = self.fc(out)
         return out
 
-# --- Guardado y carga de modelos y scaler ---
-def guardar_modelo(model, scaler, ticker, modelo_nombre):
-    os.makedirs("modelos_guardados", exist_ok=True)
-    model_path = f"modelos_guardados/{ticker}_{modelo_nombre}.pt"
-    scaler_path = f"modelos_guardados/{ticker}_{modelo_nombre}_scaler.pkl"
-    torch.save(model.state_dict(), model_path)
-    joblib.dump(scaler, scaler_path)
-    st.info(f"Modelo guardado en {model_path} y scaler en {scaler_path}")
-
-def cargar_modelo(model_class, ticker, modelo_nombre, scaler_default, **model_kwargs):
-    model_path = f"modelos_guardados/{ticker}_{modelo_nombre}.pt"
-    scaler_path = f"modelos_guardados/{ticker}_{modelo_nombre}_scaler.pkl"
-    if os.path.exists(model_path) and os.path.exists(scaler_path):
-        model = model_class(**model_kwargs).to(DEVICE)
-        model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-        scaler = joblib.load(scaler_path)
-        st.success(f"Modelo y scaler cargados desde disco.")
-        return model, scaler
-    return None, scaler_default
-
-# --- Funciones auxiliares ---
+# --- Cacheo de Datos (Streamlit) ---
+@st.cache_data(ttl=3600) # Cachea los datos por 1 hora
 def obtener_datos(ticker: str, inicio: str, fin: str) -> pd.DataFrame:
+    """
+    Obtiene datos históricos de precios de acciones usando yfinance.
+    Cachea los datos para evitar descargas repetidas.
+    """
     try:
-        datos = yf.download(ticker, start=inicio, end=fin)
-        return datos
+        data = yf.download(ticker, start=inicio, end=fin)
+        if data.empty:
+            st.error(f"No se encontraron datos para el ticker '{ticker}' en el rango de fechas {inicio} a {fin}. Por favor, verifica el ticker o el rango.")
+            return pd.DataFrame()
+        return data
     except Exception as e:
-        st.error(f"Error al obtener datos para '{ticker}': {e}")
+        st.error(f"Error al obtener datos para '{ticker}': {e}. Por favor, verifica el ticker o tu conexión a internet.")
         return pd.DataFrame()
 
+# --- Funciones Auxiliares ---
 def preprocesar_datos(datos: pd.DataFrame, columna: str = 'Close', proporcion_entrenamiento: float = 0.8):
+    """
+    Preprocesa los datos: selecciona una columna, maneja NaNs, y divide en conjuntos de entrenamiento y prueba.
+    NO realiza escalado en esta función.
+    """
     if columna not in datos.columns:
         raise ValueError(f"La columna '{columna}' no se encuentra en los datos proporcionados.")
     serie = datos[columna].dropna()
     if serie.empty:
         raise ValueError("La serie de datos está vacía después de eliminar NaNs.")
-    scaler = MinMaxScaler(feature_range=(-1, 1))
-    serie_escalada = scaler.fit_transform(serie.values.reshape(-1, 1)).flatten()
-    tamaño_entrenamiento = int(len(serie_escalada) * proporcion_entrenamiento)
-    train_scaled = serie_escalada[:tamaño_entrenamiento]
-    test_scaled = serie_escalada[tamaño_entrenamiento:]
-    return serie_escalada, scaler, train_scaled, test_scaled, serie
+    
+    tamaño_entrenamiento = int(len(serie) * proporcion_entrenamiento)
+    train_raw = serie.iloc[:tamaño_entrenamiento]
+    test_raw = serie.iloc[tamaño_entrenamiento:]
+    
+    return serie, train_raw, test_raw
 
 def create_sequences(data: np.ndarray, look_back: int):
+    """
+    Crea secuencias de datos para modelos de series temporales (RNN/Transformer).
+    """
     X, Y = [], []
     for i in range(len(data) - look_back):
         X.append(data[i:(i + look_back)])
@@ -142,359 +142,457 @@ def create_sequences(data: np.ndarray, look_back: int):
            torch.FloatTensor(np.array(Y)).unsqueeze(1).to(DEVICE)
 
 def ajustar_sesgo(prediccion: np.ndarray, sesgo: float, noise_factor: float = DEFAULT_NOISE_FACTOR) -> np.ndarray:
+    """
+    Ajusta una predicción con un sesgo y ruido aleatorio.
+    """
     if not -1 <= sesgo <= 1:
         raise ValueError("El sesgo debe estar entre -1 y 1.")
+    
+    # Calcular una tendencia simple para hacer el ajuste de sesgo más contextual
     if len(prediccion) < 2:
         tendencia = 0
     else:
         tendencia = (prediccion[-1] - prediccion[0]) / len(prediccion)
+
+    # El ajuste base es proporcional a la desviación estándar y se escala por la magnitud del sesgo
     ajuste_base = sesgo * np.std(prediccion) * (1 + abs(tendencia))
+    
+    # Añadir ruido para simular la volatilidad del mercado
     ajuste_volatilidad = np.random.normal(0, noise_factor * np.std(prediccion), len(prediccion))
+    
+    # Aplicar el sesgo de forma gradual a lo largo de la predicción
     ajuste_gradual = np.linspace(0, 1, len(prediccion)) * ajuste_base * np.sign(sesgo) if sesgo != 0 else 0
+    
     return prediccion + ajuste_gradual + ajuste_volatilidad
 
-def graficar_prediccion_futura(real: pd.Series, prediccion: np.ndarray, dias_futuros: int, ticker: str, modelo: str, sesgo: float) -> go.Figure:
-    real = real.dropna()
-    real = real[~real.index.duplicated(keep='first')]
-    if real.empty:
-        st.warning("No hay datos históricos para graficar.")
-        return go.Figure()
+# --- Guardado y Carga de Modelos/Scalers (Persistent Storage) ---
+# Se elimina @st.cache_resource para asegurar que la carga siempre se intente desde disco
+def get_model_and_scaler(model_key, model_class, ticker, **model_kwargs):
+    """
+    Intenta cargar un modelo PyTorch y su MinMaxScaler de disco.
+    Si no existen o hay un error, retorna un nuevo modelo y un MinMaxScaler unfitted por defecto.
+    Retorna una tupla: (modelo, scaler, fue_cargado_desde_disco).
+    """
+    model_path = f"modelos_guardados/{ticker}_{model_key}.pt"
+    scaler_path = f"modelos_guardados/{ticker}_{model_key}_scaler.pkl"
+
+    # Valores por defecto: nuevo modelo y scaler, no cargado desde disco
+    model_instance = model_class(**model_kwargs).to(DEVICE)
+    scaler_instance = MinMaxScaler(feature_range=(-1, 1)) # Scaler por defecto, unfitted
+    was_loaded_from_disk = False
+
+    st.write(f"DEBUG: Intentando cargar {model_key.upper()} para {ticker} desde: {model_path} y {scaler_path}")
+    st.write(f"DEBUG: Existe modelo en {model_path}? {os.path.exists(model_path)}")
+    st.write(f"DEBUG: Existe scaler en {scaler_path}? {os.path.exists(scaler_path)}")
+    
+    if os.path.exists(model_path) and os.path.exists(scaler_path):
+        try:
+            model_instance.load_state_dict(torch.load(model_path, map_location=DEVICE))
+            scaler_instance = joblib.load(scaler_path)
+            st.success(f"Modelo {model_key.upper()} y scaler cargados desde disco para {ticker}.")
+            was_loaded_from_disk = True
+        except Exception as e:
+            st.warning(f"Error al cargar el modelo {model_key.upper()} o scaler desde disco: {e}. Se procederá a entrenar uno nuevo.")
+            st.warning(f"Detalle del error de carga: {e}")
+            # Si la carga falla, procedemos con las instancias recién creadas (comportamiento por defecto)
+    
+    if not was_loaded_from_disk:
+        st.info(f"Modelo {model_key.upper()} no encontrado en disco para {ticker} o error de carga. Se entrenará uno nuevo.")
+    
+    return model_instance, scaler_instance, was_loaded_from_disk
+
+def save_model_and_scaler(model, scaler, ticker, model_key):
+    """
+    Guarda un modelo PyTorch y su MinMaxScaler a disco.
+    """
+    os.makedirs("modelos_guardados", exist_ok=True)
+    model_path = f"modelos_guardados/{ticker}_{model_key}.pt"
+    scaler_path = f"modelos_guardados/{ticker}_{model_key}_scaler.pkl"
+    torch.save(model.state_dict(), model_path)
+    joblib.dump(scaler, scaler_path)
+    st.info(f"Modelo {model_key.upper()} y scaler guardados en disco para {ticker} en {model_path}.")
+
+# --- Diccionario de iconos y explicaciones ---
+modelo_iconos = {
+    'lstm': '🧠 LSTM',
+    'rnn': '🔄 RNN',
+    'transformer': '🔗 Transformer',
+    'arima': '📈 ARIMA',
+    'prophet': '🔮 Prophet'
+}
+explicaciones = {
+    "lstm": "**LSTM (Long Short-Term Memory)** es una red neuronal recurrente avanzada, ideal para series temporales con dependencias a largo plazo. Excelente para capturar patrones complejos.",
+    "rnn": "**RNN (Recurrent Neural Network)** es una red neuronal recurrente clásica, útil para reconocer patrones en secuencias. Más simple que LSTM, pero puede tener problemas con dependencias largas.",
+    "transformer": "**Transformer** utiliza mecanismos de auto-atención para procesar secuencias en paralelo, capturando relaciones complejas a cualquier distancia. Muy potente para series temporales con patrones globales.",
+    "arima": "**ARIMA (AutoRegressive Integrated Moving Average)** es un modelo estadístico tradicional, efectivo para series temporales lineales con estacionalidad y tendencia. Requiere estacionariedad de los datos.",
+    "prophet": "**Prophet** es un modelo de predicción de series temporales de código abierto desarrollado por Facebook. Es robusto para manejar datos con fuertes efectos estacionales y de tendencia, y es fácil de ajustar incluso para no expertos."
+}
+
+# --- Pipeline principal de ejecución del modelo ---
+def ejecutar_pipeline(
+    ticker: str, inicio: str, fin: str, dias_pred: int,
+    sesgo: float = DEFAULT_BIAS, modelo_tipo: str = 'lstm',
+    look_back: int = DEFAULT_RNN_LOOK_BACK, noise_factor: float = DEFAULT_NOISE_FACTOR,
+    progress_bar = None # Para pasar la barra de progreso
+):
+    """
+    Ejecuta el pipeline de predicción para un ticker y modelo dado.
+    Devuelve la serie original, las predicciones finales y el MSE de prueba.
+    """
+    datos = obtener_datos(ticker, inicio, fin)
+    if datos.empty:
+        return None, None, None
+
+    try:
+        # Preprocesar datos sin escalar inicialmente
+        serie_original, train_raw, test_raw = preprocesar_datos(datos)
+    except ValueError as e:
+        st.error(f"Error en el preprocesamiento de datos: {e}")
+        return None, None, None
+
+    pred_scaled = []
+    pred_final = []
+    mse_test = np.nan # Inicializar como NaN para modelos que no lo calculan directamente
+
+    if modelo_tipo == 'arima':
+        try:
+            if progress_bar: progress_bar.progress(30, text=f"Entrenando ARIMA...")
+            # ARIMA trabaja con datos no escalados
+            modelo_arima = ARIMA(serie_original, order=ARIMA_ORDER)
+            modelo_fit = modelo_arima.fit()
+            if progress_bar: progress_bar.progress(60, text=f"Prediciendo con ARIMA...")
+            pred_raw = modelo_fit.forecast(steps=dias_pred)
+            
+            # Calcular MSE en el conjunto de prueba (si es posible)
+            forecast_test_raw = modelo_fit.predict(start=len(train_raw), end=len(serie_original) - 1)
+            mse_test = mean_squared_error(test_raw, forecast_test_raw) if len(test_raw) > 0 else np.nan
+
+            # Usar un scaler temporal para el ajuste de sesgo en modelos no PyTorch
+            temp_scaler_for_bias = MinMaxScaler(feature_range=(-1, 1))
+            # Fit el scaler temporal a toda la serie original para que el escalado sea consistente
+            temp_scaler_for_bias.fit(serie_original.values.reshape(-1, 1)) 
+            
+            pred_scaled_temp = temp_scaler_for_bias.transform(pred_raw.values.reshape(-1, 1)).flatten()
+            pred_ajustada_scaled = ajustar_sesgo(np.array(pred_scaled_temp), sesgo, noise_factor)
+            pred_final = temp_scaler_for_bias.inverse_transform(pred_ajustada_scaled.reshape(-1, 1)).flatten()
+
+        except Exception as e:
+            st.error(f"Error al entrenar o predecir con ARIMA: {e}")
+            return None, None, None
+
+    elif modelo_tipo in ['rnn', 'lstm', 'transformer']:
+        # Obtener el modelo y su scaler asociado (ya sea cargado o instancias nuevas)
+        # La llamada a get_model_and_scaler ahora siempre intentará cargar desde disco
+        if modelo_tipo == 'transformer':
+            model, model_scaler, was_loaded_from_disk = get_model_and_scaler('transformer', TransformerModel, ticker,
+                                                                 input_size=1, d_model=TRANSFORMER_D_MODEL,
+                                                                 nhead=TRANSFORMER_NHEAD, num_layers=TRANSFORMER_NUM_LAYERS)
+        else: # rnn o lstm
+            model, model_scaler, was_loaded_from_disk = get_model_and_scaler(modelo_tipo, RNNModel, ticker,
+                                                                 input_size=1, hidden_size=RNN_HIDDEN_SIZE,
+                                                                 num_layers=RNN_NUM_LAYERS, rnn_type=modelo_tipo)
+        
+        # SIEMPRE ajustar el scaler del modelo con los datos de entrenamiento actuales
+        # Esto asegura que el scaler esté calibrado a la distribución de datos actual
+        # sin forzar un reentrenamiento del modelo si no es necesario.
+        model_scaler.fit(train_raw.values.reshape(-1, 1))
+        
+        # Decidir si el modelo necesita ser entrenado
+        # Se entrena si el modelo no fue cargado desde disco
+        should_train = not was_loaded_from_disk
+        
+        if should_train:
+            st.info(f"Entrenando {modelo_iconos[modelo_tipo]} para {ticker}...")
+            # Escalar los datos de entrenamiento para el entrenamiento
+            train_scaled = model_scaler.transform(train_raw.values.reshape(-1, 1)).flatten()
+            X_train, Y_train = create_sequences(train_scaled, look_back)
+            train_dataset = TensorDataset(X_train, Y_train)
+            train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+            criterion = nn.MSELoss()
+            optimizer = optim.Adam(model.parameters(), lr=RNN_LEARNING_RATE)
+            
+            if progress_bar: progress_bar.progress(10, text=f"Entrenando {modelo_iconos[modelo_tipo]}...")
+            
+            for epoch in range(RNN_EPOCHS):
+                for batch_X, batch_Y in train_loader:
+                    optimizer.zero_grad()
+                    outputs = model(batch_X)
+                    loss = criterion(outputs, batch_Y)
+                    loss.backward()
+                    optimizer.step()
+                if progress_bar: progress_bar.progress(10 + int(90 * (epoch + 1) / RNN_EPOCHS), text=f"Entrenando {modelo_iconos[modelo_tipo]} (Época {epoch+1}/{RNN_EPOCHS})...")
+            
+            # Guardar el modelo recién entrenado Y el scaler que se utilizó para este entrenamiento
+            # El model_scaler ya ha sido ajustado a train_raw en este punto.
+            save_model_and_scaler(model, model_scaler, ticker, modelo_tipo)
+        else:
+            st.info(f"Modelo {modelo_iconos[modelo_tipo]} cargado desde disco para {ticker}. No se necesita reentrenar.")
+
+        # Escalar toda la serie original para la predicción, usando el model_scaler
+        serie_escalada = model_scaler.transform(serie_original.values.reshape(-1, 1)).flatten()
+
+        if progress_bar: progress_bar.progress(95, text=f"Realizando predicciones con {modelo_iconos[modelo_tipo]}...")
+        ultimos_datos_sequence = list(serie_escalada[-look_back:])
+        model.eval()
+        with torch.no_grad():
+            for i in range(dias_pred):
+                x_input = torch.FloatTensor(ultimos_datos_sequence[-look_back:]).reshape(1, look_back, 1).to(DEVICE)
+                yhat = model(x_input).item()
+                pred_scaled.append(yhat)
+                ultimos_datos_sequence.append(yhat)
+        
+        pred_ajustada_scaled = ajustar_sesgo(np.array(pred_scaled), sesgo, noise_factor)
+        # Usar el `model_scaler` (que es el cargado y recién ajustado) para la inversa_transform
+        pred_final = model_scaler.inverse_transform(pred_ajustada_scaled.reshape(-1, 1)).flatten()
+        mse_test = np.nan # No calculamos MSE para la fase de prueba directamente aquí para estos modelos.
+
+    elif modelo_tipo == 'prophet':
+        try:
+            if progress_bar: progress_bar.progress(30, text=f"Entrenando Prophet...")
+            # Prophet trabaja directamente con los datos crudos, no necesita un scaler predefinido para su ajuste
+            df_prophet = pd.DataFrame({'ds': serie_original.index, 'y': serie_original.values.flatten()})
+            modelo_prophet = Prophet(
+                seasonality_mode=PROPHET_SEASONALITY_MODE,
+                yearly_seasonality=True,
+                weekly_seasonality=False,
+                daily_seasonality=False,
+                interval_width=0.95,
+                changepoint_prior_scale=PROPHET_CHANGELPOINT_PRIOR_SCALE
+            )
+            modelo_prophet.fit(df_prophet)
+            if progress_bar: progress_bar.progress(60, text=f"Prediciendo con Prophet...")
+            futuro = modelo_prophet.make_future_dataframe(periods=dias_pred)
+            forecast = modelo_prophet.predict(futuro)
+            pred_final = forecast['yhat'].iloc[-dias_pred:].values
+            
+            # Para el ajuste de sesgo en Prophet, se usa un scaler temporal basado en la serie original
+            temp_scaler_for_bias = MinMaxScaler(feature_range=(-1, 1))
+            temp_scaler_for_bias.fit(serie_original.values.reshape(-1, 1))
+            
+            pred_scaled_temp = temp_scaler_for_bias.transform(pred_final.reshape(-1, 1)).flatten()
+            pred_final = temp_scaler_for_bias.inverse_transform(ajustar_sesgo(pred_scaled_temp, sesgo, noise_factor).reshape(-1, 1)).flatten()
+            
+            mse_test = np.nan # No calculamos MSE para la fase de prueba en Prophet directamente aquí.
+        except Exception as e:
+            st.error(f"Error al entrenar o predecir con Prophet: {e}")
+            return None, None, None
+
+    if progress_bar: progress_bar.progress(100, text=f"Predicción con {modelo_iconos[modelo_tipo]} completada.")
+    return serie_original, pred_final, mse_test
+
+# --- Interfaz Streamlit ---
+# Usar la fecha actual para 'ayer'
+ayer = (datetime.date.today() - datetime.timedelta(days=1))
+
+st.set_page_config(layout="wide", page_title="Predicción de Precios de Acciones")
+
+st.title('📈 Predicción de Precios de Acciones')
+st.markdown("---")
+
+# Sidebar para controles
+st.sidebar.header('Configuración de la Predicción')
+ticker = st.sidebar.text_input('Símbolo del Ticker (ej. AAPL)', DEFAULT_TICKER).upper()
+
+# Usar st.date_input para una mejor experiencia de usuario
+today = datetime.date.today()
+default_start_date = today - datetime.timedelta(days=365 * 3) # 3 años atrás por defecto
+start_date_input = st.sidebar.date_input('Fecha de inicio', value=default_start_date)
+end_date_input = st.sidebar.date_input('Fecha de fin', value=today - datetime.timedelta(days=1)) # Ayer
+
+predict_days = st.sidebar.number_input('Días a predecir', min_value=1, max_value=365, value=DEFAULT_PREDICT_DAYS,
+                                         help="Número de días hábiles futuros para los que se realizará la predicción.")
+bias = st.sidebar.slider('Sesgo (ajuste de la predicción)', min_value=-1.0, max_value=1.0, value=DEFAULT_BIAS, step=0.01,
+                         help="Ajusta la tendencia general de la predicción. Un valor positivo empuja los precios al alza, uno negativo a la baja.")
+noise_factor = st.sidebar.slider('Factor de ruido (aleatoriedad)', min_value=0.0, max_value=0.1, value=DEFAULT_NOISE_FACTOR, step=0.001,
+                                   help="Introduce una pequeña variabilidad aleatoria en la predicción para simular el comportamiento errático del mercado.")
+look_back = st.sidebar.number_input('Ventana temporal (look back)', min_value=10, max_value=200, value=DEFAULT_RNN_LOOK_BACK,
+                                     help="Número de días pasados que el modelo considera para hacer cada predicción. Afecta a modelos LSTM, RNN y Transformer.")
+
+modelos_disp = list(modelo_iconos.keys())
+modelos_seleccionados = st.sidebar.multiselect(
+    'Selecciona modelos a comparar', modelos_disp, default=['lstm']
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("Desarrollado con ❤️, 🧠 y ⌛ usando Streamlit")
+
+
+# Validar que al menos un modelo esté seleccionado
+if not modelos_seleccionados:
+    st.warning("Por favor, selecciona al menos un modelo para ejecutar la predicción.")
+    st.stop()
+
+modelo_principal = modelos_seleccionados[0] # El primer modelo seleccionado será el principal para la tabla de resultados
+
+# Indicador visual y explicación breve
+st.markdown(
+    f"<h3 style='color:#4F8BF9'>Modelo principal seleccionado: {modelo_iconos[modelo_principal]}</h3>",
+    unsafe_allow_html=True
+)
+st.info(explicaciones[modelo_principal])
+
+if st.button('Generar Predicción'):
+    # Validaciones de fechas
+    if start_date_input >= end_date_input:
+        st.error("La fecha de inicio debe ser anterior a la fecha de fin.")
+        st.stop()
+    
+    if end_date_input >= today:
+        st.warning(f"La fecha de fin seleccionada ({end_date_input}) es igual o posterior a la fecha actual. Los datos de cierre de hoy aún no están disponibles o no se habrán consolidado.")
+        # No se detiene, pero avisa. El usuario puede querer predecir hasta hoy.
+
+    progress_text = "Iniciando la predicción..."
+    main_progress_bar = st.progress(0, text=progress_text)
+
+    # Convertir fechas a string para yfinance y funciones internas
+    start_date_str = start_date_input.strftime("%Y-%m-%d")
+    end_date_str = end_date_input.strftime("%Y-%m-%d")
+
+    # Ejecutar el pipeline para el modelo principal solo para obtener la serie_original
+    # La predicción real para cada modelo se hará en el bucle posterior
+    # Se llama con un placeholder para progress_bar ya que la barra principal se usa para todos los modelos
+    serie_original, _, _ = ejecutar_pipeline(
+        ticker, start_date_str, end_date_str, predict_days,
+        bias, modelo_principal, look_back, noise_factor, progress_bar=main_progress_bar
+    )
+
+    if serie_original is None or serie_original.empty:
+        st.error("No se pudo procesar la predicción. Por favor, revisa los parámetros e inténtalo de nuevo.")
+        st.stop()
+
     df_hist = pd.DataFrame({
-        'Fecha': real.index,
-        'Precio': real.values.flatten()
+        'Fecha': serie_original.index,
+        'Precio': serie_original.values.flatten()
     })
-    ultima_fecha_historica = real.index[-1]
-    fechas_futuras = pd.bdate_range(start=ultima_fecha_historica + pd.Timedelta(days=1), periods=dias_futuros)
-    if len(prediccion) > len(fechas_futuras):
-        prediccion = prediccion[:len(fechas_futuras)]
-    elif len(prediccion) < len(fechas_futuras):
-        fechas_futuras = fechas_futuras[:len(prediccion)]
-    df_pred = pd.DataFrame({
-        'Fecha': fechas_futuras,
-        'Precio': prediccion.flatten()
-    })
-    color_pred = 'green' if sesgo > 0 else 'red' if sesgo < 0 else 'blue'
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
+
+    # --- Gráfico de datos históricos ---
+    st.subheader("📊 Datos Históricos")
+    fig_hist = go.Figure()
+    fig_hist.add_trace(go.Scatter(
         x=df_hist['Fecha'],
         y=df_hist['Precio'],
         mode='lines',
         name='Histórico',
         line=dict(color='white', width=2)
     ))
-    fig.add_trace(go.Scatter(
-        x=df_pred['Fecha'],
-        y=df_pred['Precio'],
-        mode='lines+markers',
-        name=f'Predicción (sesgo: {sesgo:.2f})',
-        line=dict(color=color_pred, dash='dash'),
-        marker=dict(color=color_pred, size=6)
-    ))
-    if not df_hist.empty:
-        fig.add_trace(go.Scatter(
-            x=[df_hist['Fecha'].iloc[-1]],
-            y=[df_hist['Precio'].iloc[-1]],
-            mode='markers+text',
-            name='Último real',
-            marker=dict(color='white', size=10, symbol='circle'),
-            text=[f"Último real: {df_hist['Precio'].iloc[-1]:.2f}"],
-            textposition="top center",
-            showlegend=False
-        ))
-    if not df_pred.empty:
-        fig.add_trace(go.Scatter(
-            x=[df_pred['Fecha'].iloc[0]],
-            y=[df_pred['Precio'].iloc[0]],
-            mode='markers+text',
-            name='Primera predicción',
-            marker=dict(color=color_pred, size=10, symbol='circle'),
-            text=[f"Primera pred: {df_pred['Precio'].iloc[0]:.2f}"],
-            textposition="bottom center",
-            showlegend=False
-        ))
-    fig.update_layout(
-        title=dict(
-            text=f'Predicción de {ticker.upper()} con {modelo.upper()}<br><sup>Sesgo aplicado: {sesgo:.2f} {"(Optimista)" if sesgo > 0 else "(Pesimista)" if sesgo < 0 else "(Neutral)"}</sup>',
-            x=0.5,
-            xanchor='center',
-            font=dict(size=20)
-        ),
-        xaxis_title='Fecha',
-        yaxis_title='Precio (USD)',
-        template='plotly_dark',
-        margin=dict(t=100),
-        legend=dict(
-            orientation='h',
-            yanchor='bottom',
-            y=-0.25,
-            xanchor='center',
-            x=0.5
-        )
-    )
-    return fig
 
-# --- Pipeline principal ---
-def ejecutar_pipeline(ticker: str, inicio: str, fin: str, dias_pred: int,
-                      sesgo: float = DEFAULT_BIAS, modelo: str = 'lstm',
-                      look_back: int = DEFAULT_RNN_LOOK_BACK, noise_factor: float = DEFAULT_NOISE_FACTOR):
-    datos = obtener_datos(ticker, inicio, fin)
-    if datos.empty:
-        return None, None, None, None, None, None, None
-
-    try:
-        # Preprocesamiento de datos para todos los modelos.
-        # Prophet usará serie_original, los otros serie_escalada
-        serie_escalada, scaler, train_scaled, test_scaled, serie_original = preprocesar_datos(datos)
-    except ValueError as e:
-        st.error(f"Error en el preprocesamiento de datos: {e}")
-        return None, None, None, None, None, None, None
-
-    pred_scaled = []
-    pred_final = [] # Inicializar pred_final para todos los modelos
-    mse_test = None
-
-    if modelo == 'arima':
-        try:
-            modelo_arima = ARIMA(serie_escalada, order=ARIMA_ORDER)
-            modelo_fit = modelo_arima.fit()
-            pred_scaled = modelo_fit.forecast(steps=dias_pred)
-            forecast_test_scaled = modelo_fit.predict(start=len(train_scaled), end=len(serie_escalada) - 1)
-            mse_test = mean_squared_error(test_scaled, forecast_test_scaled)
-            pred_ajustada_scaled = ajustar_sesgo(np.array(pred_scaled), sesgo, noise_factor)
-            pred_final = scaler.inverse_transform(pred_ajustada_scaled.reshape(-1, 1)).flatten()
-
-        except Exception as e:
-            st.error(f"Error al entrenar o predecir con ARIMA: {e}")
-            return None, None, None, None, None, None, None
-
-    elif modelo == 'transformer':
-        # Cargar o entrenar el modelo Transformer con los parámetros actualizados
-        model, scaler = cargar_modelo(
-            TransformerModel, ticker, 'transformer', scaler,
-            input_size=1, d_model=TRANSFORMER_D_MODEL, nhead=TRANSFORMER_NHEAD, num_layers=TRANSFORMER_NUM_LAYERS
-        )
-        if model is None:
-            X_train, Y_train = create_sequences(train_scaled, look_back)
-            # Instanciar el modelo con los parámetros actualizados
-            model = TransformerModel(input_size=1, d_model=TRANSFORMER_D_MODEL, nhead=TRANSFORMER_NHEAD, num_layers=TRANSFORMER_NUM_LAYERS).to(DEVICE)
-            criterion = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=RNN_LEARNING_RATE)
-            st.write(f"Entrenando modelo TRANSFORMER en {DEVICE} ({RNN_EPOCHS} épocas)...")
-            progress_bar = st.progress(0)
-            model.train()
-            for epoch in range(RNN_EPOCHS):
-                optimizer.zero_grad()
-                outputs = model(X_train)
-                loss = criterion(outputs, Y_train)
-                loss.backward()
-                optimizer.step()
-                progress_bar.progress((epoch + 1) / RNN_EPOCHS)
-            progress_bar.empty()
-            st.success("Entrenamiento completado.")
-            guardar_modelo(model, scaler, ticker, 'transformer')
-
-        ultimos_datos_sequence = list(serie_escalada[-look_back:])
-        model.eval()
-        with torch.no_grad():
-            for i in range(dias_pred):
-                x_input = torch.FloatTensor(ultimos_datos_sequence[-look_back:]).reshape(1, look_back, 1).to(DEVICE)
-                yhat = model(x_input).item()
-                pred_scaled.append(yhat)
-                ultimos_datos_sequence.append(yhat)
-        
-        pred_ajustada_scaled = ajustar_sesgo(np.array(pred_scaled), sesgo, noise_factor)
-        pred_final = scaler.inverse_transform(pred_ajustada_scaled.reshape(-1, 1)).flatten()
-        mse_test = np.nan # No se calcula MSE en test para la predicción del futuro.
-
-    elif modelo in ['rnn', 'lstm']:
-        model, scaler = cargar_modelo(
-            RNNModel, ticker, modelo, scaler,
-            input_size=1, hidden_size=RNN_HIDDEN_SIZE, num_layers=RNN_NUM_LAYERS, rnn_type=modelo
-        )
-        if model is None:
-            X_train, Y_train = create_sequences(train_scaled, look_back)
-            model = RNNModel(input_size=1, hidden_size=RNN_HIDDEN_SIZE, num_layers=RNN_NUM_LAYERS, rnn_type=modelo).to(DEVICE)
-            criterion = nn.MSELoss()
-            optimizer = optim.Adam(model.parameters(), lr=RNN_LEARNING_RATE)
-            st.write(f"Entrenando modelo {modelo.upper()} en {DEVICE} ({RNN_EPOCHS} épocas)...")
-            progress_bar = st.progress(0)
-            model.train()
-            for epoch in range(RNN_EPOCHS):
-                optimizer.zero_grad()
-                outputs = model(X_train)
-                loss = criterion(outputs, Y_train)
-                loss.backward()
-                optimizer.step()
-                progress_bar.progress((epoch + 1) / RNN_EPOCHS)
-            progress_bar.empty()
-            st.success("Entrenamiento completado.")
-            guardar_modelo(model, scaler, ticker, modelo)
-
-        ultimos_datos_sequence = list(serie_escalada[-look_back:])
-        model.eval()
-        with torch.no_grad():
-            for i in range(dias_pred):
-                x_input = torch.FloatTensor(ultimos_datos_sequence[-look_back:]).reshape(1, look_back, 1).to(DEVICE)
-                yhat = model(x_input).item()
-                pred_scaled.append(yhat)
-                ultimos_datos_sequence.append(yhat)
-        
-        pred_ajustada_scaled = ajustar_sesgo(np.array(pred_scaled), sesgo, noise_factor)
-        pred_final = scaler.inverse_transform(pred_ajustada_scaled.reshape(-1, 1)).flatten()
-        mse_test = np.nan # No se calcula MSE en test para la predicción del futuro.
+    # Resaltar el último precio histórico
+    last_date = serie_original.index[-1]
+    last_price = serie_original.iloc[-1]
     
-    elif modelo == 'prophet':
-        try:
-            # Preparar los datos para Prophet (ds y y)
-            # Asegurarse que 'y' es un array 1D
-            df_prophet = pd.DataFrame({'ds': serie_original.index, 'y': serie_original.values.flatten()})
+    # Añadir la línea vertical
+    fig_hist.add_vline(x=last_date.strftime("%Y-%m-%d"), line_width=1, line_dash="dash", line_color="red")
 
-            # Instanciar y ajustar el modelo Prophet con el parámetro changepoint_prior_scale
-            modelo_prophet = Prophet(
-                seasonality_mode=PROPHET_SEASONALITY_MODE, # O 'additive'
-                yearly_seasonality=True,
-                weekly_seasonality=False, # Cambiado a False por defecto para stock
-                daily_seasonality=False,
-                interval_width=0.95, # Intervalo de confianza
-                changepoint_prior_scale=PROPHET_CHANGELPOINT_PRIOR_SCALE # Nuevo parámetro para flexibilidad
-            )
-            
-            st.write("Entrenando modelo PROPHET...")
-            modelo_prophet.fit(df_prophet)
-            st.success("Entrenamiento completado.")
+    # Añadir la anotación del último dato histórico
+    fig_hist.add_annotation(
+        x=last_date.strftime("%Y-%m-%d"),
+        y=1.05,
+        xref="x",
+        yref="paper",
+        text="Último Dato Histórico",
+        showarrow=True,
+        arrowhead=2,
+        ax=0,
+        ay=-40,
+        font=dict(color="red", size=12),
+        bgcolor="rgba(255, 255, 255, 0.7)",
+        bordercolor="red",
+        borderwidth=1,
+        borderpad=4,
+        opacity=0.8
+    )
 
-            # Crear dataframe para las fechas futuras a predecir
-            future = modelo_prophet.make_future_dataframe(periods=dias_pred, include_history=False) 
+    fig_hist.add_trace(go.Scatter(
+        x=[last_date],
+        y=[last_price],
+        mode='markers',
+        name='Último Precio Histórico',
+        marker=dict(size=10, color='red', symbol='circle'),
+        showlegend=True
+    ))
+    
+    fig_hist.update_layout(
+        title=f"Precios Históricos de {ticker}",
+        hovermode="x unified",
+        template="plotly_dark",
+        xaxis=dict(rangeslider=dict(visible=True)),
+        legend=dict(orientation='h', yanchor='bottom', y=-0.25, xanchor='center', x=0.5)
+    )
+    st.plotly_chart(fig_hist, use_container_width=True)
 
-            # Realizar la predicción
-            forecast = modelo_prophet.predict(future)
-            # Prophet ya predice en la escala original, no necesita inverse_transform
-            pred_bruta = forecast['yhat'].values 
-            
-            # Aplicar el sesgo a la predicción de Prophet
-            pred_final = ajustar_sesgo(pred_bruta, sesgo, noise_factor)
-            mse_test = np.nan # MSE en test para Prophet no se calcula en esta implementación simplificada
+    # --- Gráfico de predicciones ---
+    st.subheader("📈 Predicciones de Precios Futuros")
+    fig_pred = go.Figure()
 
-        except Exception as e:
-            st.error(f"Error al entrenar o predecir con Prophet: {e}")
-            return None, None, None, None, None, None, None
+    colores = ['orange', 'cyan', 'magenta', 'lime', 'yellow', 'purple', 'lightgreen', 'pink']
+    
+    # Lista para almacenar resultados de MSE
+    mse_results = {}
+    pred_final_main_model = None # Inicializar para almacenar la predicción del modelo principal
 
-    else:
-        st.error("Modelo no soportado. Por favor, elige 'arima', 'rnn', 'lstm', 'transformer' o 'prophet'.")
-        return None, None, None, None, None, None, None
-
-    serie_real = pd.Series(serie_original.values.flatten(), index=serie_original.index)
-
-    # Calcular fechas futuras y df_pred aquí, para que puedan ser devueltas y almacenadas en session_state
-    fecha_ultima = serie_real.index[-1]
-    fechas_futuras = pd.bdate_range(start=fecha_ultima + pd.Timedelta(days=1), periods=dias_pred)
-    df_pred = pd.DataFrame({
-        'Fecha': fechas_futuras,
-        'Valor_Predicho': pred_final
-    })
-
-    fig = graficar_prediccion_futura(serie_real, pred_final, dias_pred, ticker, modelo, sesgo)
-    return pred_final, mse_test, serie_real, scaler, fig, fechas_futuras, df_pred
-
-# --- Interfaz de usuario ---
-st.title("Predicción de Series Temporales con Modelos Avanzados")
-st.sidebar.header("Configuración")
-
-ticker = st.sidebar.text_input("Ticker", DEFAULT_TICKER)
-inicio = st.sidebar.date_input("Fecha de inicio", pd.to_datetime(DEFAULT_START_DATE))
-fin = st.sidebar.date_input("Fecha de fin", pd.to_datetime(DEFAULT_END_DATE))
-dias_pred = st.sidebar.slider("Días a predecir", 7, 90, DEFAULT_PREDICT_DAYS)
-sesgo = st.sidebar.slider("Sesgo de mercado", -1.0, 1.0, DEFAULT_BIAS, 0.05)
-modelo = st.sidebar.selectbox(
-    "Modelo a utilizar",
-    ('arima', 'rnn', 'lstm', 'transformer', 'prophet')
-)
-look_back = st.sidebar.slider("Ventana de look-back", 10, 120, DEFAULT_RNN_LOOK_BACK)
-noise_factor = st.sidebar.slider("Ruido (simulación volatilidad)", 0.0, 0.1, DEFAULT_NOISE_FACTOR, 0.01)
-
-# Inicializar variables de session_state si no existen
-if 'prediction_made' not in st.session_state:
-    st.session_state.prediction_made = False
-if 'pred_final' not in st.session_state:
-    st.session_state.pred_final = None
-if 'mse_test' not in st.session_state:
-    st.session_state.mse_test = None
-if 'serie_real' not in st.session_state:
-    st.session_state.serie_real = None
-if 'scaler' not in st.session_state:
-    st.session_state.scaler = None
-if 'fig' not in st.session_state:
-    st.session_state.fig = None
-if 'fechas_futuras' not in st.session_state:
-    st.session_state.fechas_futuras = pd.DatetimeIndex([]) # Inicializar como DatetimeIndex vacío
-if 'df_pred' not in st.session_state:
-    st.session_state.df_pred = pd.DataFrame(columns=['Fecha', 'Valor_Predicho']) # Inicializar como DataFrame vacío
-if 'selected_date_tab2' not in st.session_state:
-    st.session_state.selected_date_tab2 = pd.to_datetime(DEFAULT_END_DATE).date() # Fecha inicial por defecto
-
-
-if st.button("Predecir"):
-    with st.spinner("Ejecutando pipeline..."):
-        (st.session_state.pred_final,
-         st.session_state.mse_test,
-         st.session_state.serie_real,
-         st.session_state.scaler,  # <--- Add this line
-         st.session_state.fig,
-         st.session_state.fechas_futuras,
-         st.session_state.df_pred) = ejecutar_pipeline(
-            ticker, str(inicio), str(fin), dias_pred, sesgo, modelo, look_back, noise_factor
-        )
-        if st.session_state.pred_final is not None and len(st.session_state.pred_final) > 0:
-            st.session_state.prediction_made = True
-            if not st.session_state.fechas_futuras.empty:
-                st.session_state.selected_date_tab2 = st.session_state.fechas_futuras[0].date()
-        else:
-            st.session_state.prediction_made = False
-
-# Mostrar resultados solo si se ha realizado una predicción y está almacenada
-if st.session_state.prediction_made:
-    st.subheader("Resultados de la Predicción")
-
-    tab1, tab2, tab3 = st.tabs(["📈 Gráfico", "📅 Valor por Fecha", "📋 Tabla de Predicción"])
-
-    with tab1:
-        st.plotly_chart(st.session_state.fig, use_container_width=True)
-        if st.session_state.mse_test is not None and not np.isnan(st.session_state.mse_test):
-            st.info(f"MSE en test: {st.session_state.mse_test:.6f}")
-
-    with tab2:
-        st.write("Selecciona una fecha dentro del rango predicho para consultar el valor estimado.")
+    for idx, modelo in enumerate(modelos_seleccionados):
+        # Reiniciar barra de progreso para cada modelo
+        model_progress_text = f"Calculando predicción con {modelo_iconos[modelo]}..."
+        model_progress_bar = st.progress(0, text=model_progress_text) # Nueva barra para cada modelo
         
-        # Asegurarse de que min_value y max_value solo se establezcan si fechas_futuras no está vacío
-        min_date_input = None
-        max_date_input = None
-        current_date_input_value = st.session_state.selected_date_tab2 # Usar el valor guardado
-
-        if not st.session_state.fechas_futuras.empty:
-            min_date_input = st.session_state.fechas_futuras[0].date()
-            max_date_input = st.session_state.fechas_futuras[-1].date()
+        # Ejecutar el pipeline para cada modelo seleccionado
+        _, pred, mse = ejecutar_pipeline(
+            ticker, start_date_str, end_date_str, predict_days, bias, modelo, look_back, noise_factor,
+            progress_bar=model_progress_bar
+        )
+        
+        if pred is not None and len(pred) > 0:
+            # Calcular fechas de predicción (días hábiles)
+            fechas_pred = pd.bdate_range(start=serie_original.index[-1] + pd.Timedelta(days=1), periods=len(pred))
             
-            # Ajustar current_date_input_value si está fuera del nuevo rango (por ejemplo, si se cambió el ticker)
-            if not (min_date_input <= current_date_input_value <= max_date_input):
-                 current_date_input_value = min_date_input
-
-
-        if min_date_input and max_date_input:
-            fecha_input = st.date_input("Fecha objetivo:",
-                                        value=current_date_input_value, # Usar el valor determinado
-                                        min_value=min_date_input,
-                                        max_value=max_date_input,
-                                        key='date_input_tab2') # Añadir una key para preservar el estado
-            st.session_state.selected_date_tab2 = fecha_input # Almacenar la fecha seleccionada
+            fig_pred.add_trace(go.Scatter(
+                x=fechas_pred,
+                y=pred,
+                mode='lines+markers',
+                name=f'Predicción {modelo_iconos[modelo]}',
+                line=dict(color=colores[idx % len(colores)], dash='dash'),
+                marker=dict(size=6)
+            ))
+            if not np.isnan(mse):
+                mse_results[modelo] = mse
             
-            valor_predicho = st.session_state.df_pred[st.session_state.df_pred['Fecha'].dt.date == fecha_input]['Valor_Predicho']
-            if not valor_predicho.empty:
-                st.success(f"📆 Valor predicho para {fecha_input}: **${valor_predicho.values[0]:.2f}**")
-            else:
-                st.warning("La fecha seleccionada no está dentro del rango de predicción.")
-        else:
-            st.info("Haz clic en 'Predecir' para generar las fechas de predicción.")
+            # Guardar la predicción del modelo principal para la tabla final
+            if modelo == modelo_principal:
+                pred_final_main_model = pred
 
+        model_progress_bar.empty() # Ocultar la barra de progreso de este modelo al finalizar
 
-    with tab3:
-        st.dataframe(st.session_state.df_pred, use_container_width=True)
+    fig_pred.update_layout(
+        title=f"Predicciones de Precios para {ticker}",
+        hovermode="x unified",
+        template="plotly_dark",
+        legend=dict(orientation='h', yanchor='bottom', y=-0.25, xanchor='center', x=0.5)
+    )
+    st.plotly_chart(fig_pred, use_container_width=True)
+
+    # Mostrar tabla de predicciones del modelo principal
+    if pred_final_main_model is not None and len(pred_final_main_model) > 0:
+        st.subheader(f"Valores predichos (modelo principal: {modelo_iconos[modelo_principal]})")
+        df_pred = pd.DataFrame({
+            "Fecha": pd.bdate_range(start=serie_original.index[-1] + pd.Timedelta(days=1), periods=len(pred_final_main_model)),
+            "Predicción": pred_final_main_model
+        })
+        st.dataframe(df_pred.style.format({"Predicción": "{:.2f}"})) # Formatear a 2 decimales
+        csv = df_pred.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Descargar predicciones en CSV",
+            data=csv,
+            file_name=f'predicciones_{ticker}_{modelo_principal}.csv',
+            mime='text/csv'
+        )
+    
+    # Mostrar resultados de MSE si hay alguno
+    if mse_results:
+        st.subheader("Métricas de Evaluación (MSE en conjunto de prueba)")
+        mse_df = pd.DataFrame(mse_results.items(), columns=['Modelo', 'MSE'])
+        mse_df['Modelo'] = mse_df['Modelo'].apply(lambda x: modelo_iconos[x])
+        st.table(mse_df.style.format({"MSE": "{:.4f}"}))
+        st.info("Nota: El MSE se calcula en el conjunto de prueba (histórico) del modelo. Algunos modelos (RNN/Transformer/Prophet) pueden no tener un MSE directo mostrado aquí si no se implementa una evaluación explícita post-entrenamiento.")
+
+    main_progress_bar.empty() # Ocultar la barra de progreso principal al finalizar
